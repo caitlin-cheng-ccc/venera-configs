@@ -7,7 +7,7 @@ class Mh160 extends ComicSource {
     // unique id of the source
     key = "mh160"
 
-    version = "1.0.0"
+    version = "1.0.1"
 
     minAppVersion = "1.4.0"
 
@@ -24,6 +24,31 @@ class Mh160 extends ComicSource {
 
     get baseUrl() {
         return `https://${this.loadSetting("domain")}`;
+    }
+
+    // Only search is behind Cloudflare. "Logging in" opens a search page in
+    // the in-app browser, which solves the challenge; the resulting
+    // cf_clearance cookie is then used by Network requests (same approach as
+    // mycomic.js).
+    account = {
+        loginWithWebview: {
+            url: "https://www.mh160mh.com/statics/searchelxt1e1.aspx?key=%E6%96%97%E7%BD%97",
+            checkStatus: (url, title) => {
+                if (!url || !title) {
+                    return false;
+                }
+                if (/moment|Cloudflare|challenge|请稍候/i.test(title)) {
+                    return false;
+                }
+                return url.indexOf("mh160mh.com") !== -1;
+            },
+        },
+
+        logout: () => {
+            Network.deleteCookies(this.baseUrl);
+        },
+
+        registerWebsite: null,
     }
 
     // Pages, covers (p.miyeye.cn) and chapter images all reject requests
@@ -43,6 +68,10 @@ class Mh160 extends ComicSource {
     legacyImageHost = "mhpic6.tgmhfc.uk"
     legacyImageMaxId = 542724
 
+    // listings that only exist on the desktop site
+    desktopOnlyLists = ["all", "allhit"]
+    desktopUserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36"
+
     // first path segments under /kanmanhua/ that are listings, not comics
     listingSlugs = ["all", "allhit", "html", "rexue", "gedou", "kehuan", "jingji", "gaoxiao", "tuili", "kongbu", "danmei", "shaonv", "lianai", "shenghuo", "zhanzheng", "gushi", "maoxian", "mohuan", "xuanhuan", "xiaoyuan", "xuanyi", "mengxi", "chuanyue", "hougong", "dushi", "wuxia", "lishi", "tongren"]
 
@@ -60,8 +89,8 @@ class Mh160 extends ComicSource {
      * @param res {{status: number, body: string}}
      */
     checkResponse(res) {
-        if (res.status === 403 && /Just a moment|challenge-platform|cf_chl/.test(res.body)) {
-            throw "Cloudflare 验证拦截：请通过应用内的 Cloudflare 验证后重试";
+        if ((res.status === 403 || res.status === 503) && /Just a moment|challenge-platform|cf_chl/.test(res.body)) {
+            throw "Cloudflare 验证拦截：请在漫画源设置中点击「登录」，在内置浏览器中完成一次 Cloudflare 验证后重试";
         }
         if (res.status !== 200) {
             throw `Invalid status code: ${res.status}`;
@@ -70,10 +99,11 @@ class Mh160 extends ComicSource {
 
     /**
      * @param url {string}
+     * @param extraHeaders {object?}
      * @returns {Promise<HtmlDocument>}
      */
-    async getHtml(url) {
-        const res = await Network.get(url, this.headers);
+    async getHtml(url, extraHeaders) {
+        const res = await Network.get(url, { ...this.headers, ...extraHeaders });
         this.checkResponse(res);
         return new HtmlDocument(res.body);
     }
@@ -141,6 +171,50 @@ class Mh160 extends ComicSource {
             }));
         }
         return comics;
+    }
+
+    /**
+     * Parse the mobile site's list layout ("#listbody li"). Cloudflare caches
+     * the www -> m.mh160mh.com redirect it sends to mobile browsers and serves
+     * it to everyone, so any listing may come back as the mobile page.
+     * @param element {HtmlElement|HtmlDocument}
+     * @returns {Comic[]}
+     */
+    parseMobileList(element) {
+        const comics = [];
+        for (let li of element.querySelectorAll("#listbody li")) {
+            const a = li.querySelector("a.ImgA");
+            const id = a ? this.parseId(a.attributes["href"] || "") : null;
+            if (!id) {
+                continue;
+            }
+            const img = a.querySelector("img");
+            const titleEl = li.querySelector(".txtA");
+            const infoEl = li.querySelector(".info");
+            comics.push(new Comic({
+                id: id,
+                title: titleEl ? titleEl.text.trim() : "",
+                subtitle: infoEl ? infoEl.text.trim() : undefined,
+                cover: img ? img.attributes["src"] : undefined,
+            }));
+        }
+        return comics;
+    }
+
+    /**
+     * Parse a listing page in either the desktop or the mobile layout.
+     * The mobile layout has no pager, so assume another page while results keep coming.
+     * @param doc {HtmlDocument}
+     * @param page {number}
+     * @returns {{comics: Comic[], maxPage: number}}
+     */
+    parseListPage(doc, page) {
+        const comics = this.parseList(doc);
+        if (comics.length > 0) {
+            return { comics, maxPage: this.parseMaxPage(doc, page) };
+        }
+        const mobile = this.parseMobileList(doc);
+        return { comics: mobile, maxPage: mobile.length > 0 ? page + 1 : page };
     }
 
     /**
@@ -295,28 +369,32 @@ class Mh160 extends ComicSource {
             if (page > 1) {
                 url += `${page}.html`;
             }
-            const doc = await this.getHtml(url);
-            return {
-                comics: this.parseList(doc),
-                maxPage: this.parseMaxPage(doc, page),
-            };
+            if (!this.desktopOnlyLists.includes(param)) {
+                const doc = await this.getHtml(url);
+                return this.parseListPage(doc, page);
+            }
+            // These lists don't exist on the mobile site, so a cached
+            // www -> m. redirect would 404. The query string gives a cache key
+            // no browser shares, and the desktop UA keeps the origin from
+            // redirecting (these pages have no Cloudflare check).
+            url = url.replace("://m.", "://www.");
+            const doc = await this.getHtml(`${url}?desktop=1`, { "User-Agent": this.desktopUserAgent });
+            return this.parseListPage(doc, page);
         },
     }
 
     /// search related
     search = {
         load: async (keyword, options, page) => {
-            // search is behind Cloudflare; the app's built-in verification
-            // flow is needed the first time
-            let url = `${this.baseUrl}/statics/search.aspx?key=${encodeURIComponent(keyword)}`;
+            // search is behind Cloudflare: log in once (account below) to get
+            // the cf_clearance cookie. The search form posts to this path;
+            // the statics/search.aspx path in the mobile site's JS is a 404.
+            let url = `${this.baseUrl}/statics/searchelxt1e1.aspx?key=${encodeURIComponent(keyword)}`;
             if (page > 1) {
                 url += `&page=${page}`;
             }
             const doc = await this.getHtml(url);
-            return {
-                comics: this.parseList(doc),
-                maxPage: this.parseMaxPage(doc, page),
-            };
+            return this.parseListPage(doc, page);
         },
 
         // enable tags suggestions
@@ -328,60 +406,19 @@ class Mh160 extends ComicSource {
         loadInfo: async (id) => {
             const doc = await this.getHtml(`${this.baseUrl}/kanmanhua/${id}/`);
 
-            const title = doc.querySelector(".mh-date-info-name h4").text.trim();
-            const coverImg = doc.querySelector(".mh-date-bgpic img");
-            const cover = coverImg ? coverImg.attributes["src"] : undefined;
-
-            const descEl = doc.querySelector("#workint");
-            let description = descEl ? descEl.text.trim() : "";
-            if (/^\.*$/.test(description)) {
-                description = undefined;
+            // Cloudflare may serve a cached redirect to the mobile site, so
+            // the page can be in either layout
+            let details;
+            if (doc.querySelector(".mh-date-info-name h4")) {
+                details = this.parseDesktopDetails(doc);
+            } else if (doc.querySelector(".Introduct .sub_r")) {
+                details = this.parseMobileDetails(doc);
+            } else {
+                throw "Failed to parse comic page";
             }
-
-            const tags = {};
-            const authors = doc.querySelectorAll(".works-info-tc .one a").map((a) => a.text.trim()).filter((s) => s);
-            if (authors.length > 0) {
-                tags["作者"] = authors;
-            }
-            for (let span of doc.querySelectorAll(".works-info-tc span")) {
-                const text = span.text.replace(/\s+/g, "");
-                if (text.startsWith("状态：")) {
-                    tags["状态"] = [text.slice(3)];
-                }
-            }
-
-            // each list is newest-first; reverse into reading order.
-            // Chapter ids are numeric, so a plain object would reorder them
-            // by id; a Map keeps the site's order.
-            const chapters = new Map();
-            for (let ul of doc.querySelectorAll(".cy_plist ul")) {
-                const links = ul.querySelectorAll("a").reverse();
-                for (let a of links) {
-                    const m = (a.attributes["href"] || "").match(/\/(\d+)\.html/);
-                    if (!m) {
-                        continue;
-                    }
-                    chapters.set(m[1], a.text.trim());
-                }
-            }
-
-            const updateEl = doc.querySelector(".cy_zhangjie_top font");
-
-            const relatedBlock = doc.querySelector(".mh-nlook");
-            const recommend = relatedBlock
-                ? this.parseRelated(relatedBlock).filter((c) => c.id !== id)
-                : [];
-
-            return new ComicDetails({
-                title: title,
-                cover: cover,
-                description: description,
-                tags: tags,
-                chapters: chapters,
-                updateTime: updateEl ? updateEl.text.trim() : undefined,
-                recommend: recommend,
-                url: `${this.baseUrl}/kanmanhua/${id}/`,
-            });
+            details.recommend = details.recommend.filter((c) => c.id !== id);
+            details.url = `${this.baseUrl}/kanmanhua/${id}/`;
+            return new ComicDetails(details);
         },
 
         loadEp: async (comicId, epId) => {
@@ -434,6 +471,125 @@ class Mh160 extends ComicSource {
 
         // enable tags translate
         enableTagsTranslate: false,
+    }
+
+    /**
+     * Collect chapters from newest-first lists into reading order.
+     * Chapter ids are numeric, so a plain object would reorder them by id;
+     * a Map keeps the site's order.
+     * @param doc {HtmlDocument}
+     * @param listSelector {string}
+     * @returns {Map<string, string>}
+     */
+    parseChapters(doc, listSelector) {
+        const chapters = new Map();
+        for (let ul of doc.querySelectorAll(listSelector)) {
+            const links = ul.querySelectorAll("a").reverse();
+            for (let a of links) {
+                const m = (a.attributes["href"] || "").match(/\/(\d+)\.html/);
+                if (!m) {
+                    continue;
+                }
+                chapters.set(m[1], a.text.trim());
+            }
+        }
+        return chapters;
+    }
+
+    /**
+     * the site uses "..." for an empty description
+     * @param el {HtmlElement|null}
+     * @returns {string|undefined}
+     */
+    parseDescription(el) {
+        const text = el ? el.text.trim() : "";
+        return /^\.*$/.test(text) ? undefined : text;
+    }
+
+    /**
+     * Detail page on www.mh160mh.com.
+     * @param doc {HtmlDocument}
+     */
+    parseDesktopDetails(doc) {
+        const coverImg = doc.querySelector(".mh-date-bgpic img");
+
+        const tags = {};
+        const authors = doc.querySelectorAll(".works-info-tc .one a").map((a) => a.text.trim()).filter((s) => s);
+        if (authors.length > 0) {
+            tags["作者"] = authors;
+        }
+        for (let span of doc.querySelectorAll(".works-info-tc span")) {
+            const text = span.text.replace(/\s+/g, "");
+            if (text.startsWith("状态：")) {
+                tags["状态"] = [text.slice(3)];
+            }
+        }
+
+        const updateEl = doc.querySelector(".cy_zhangjie_top font");
+        const relatedBlock = doc.querySelector(".mh-nlook");
+
+        return {
+            title: doc.querySelector(".mh-date-info-name h4").text.trim(),
+            cover: coverImg ? coverImg.attributes["src"] : undefined,
+            description: this.parseDescription(doc.querySelector("#workint")),
+            tags: tags,
+            chapters: this.parseChapters(doc, ".cy_plist ul"),
+            updateTime: updateEl ? updateEl.text.trim() : undefined,
+            recommend: relatedBlock ? this.parseRelated(relatedBlock) : [],
+        };
+    }
+
+    /**
+     * Detail page on m.mh160mh.com. Info is a list of "标签：值" lines;
+     * its "状态" line holds the latest chapter, not the status, so it is skipped.
+     * @param doc {HtmlDocument}
+     */
+    parseMobileDetails(doc) {
+        const coverImg = doc.querySelector("#Cover img");
+
+        const tags = {};
+        let updateTime;
+        for (let p of doc.querySelectorAll(".sub_r .txtItme")) {
+            const text = p.text.trim();
+            const idx = text.indexOf("：");
+            if (idx === -1) {
+                continue;
+            }
+            const label = text.slice(0, idx).trim();
+            const value = text.slice(idx + 1).trim();
+            if (!value) {
+                continue;
+            }
+            if (label === "作者" || label === "标签") {
+                tags[label] = value.split(/\s+/);
+            } else if (label === "时间") {
+                updateTime = value;
+            }
+        }
+
+        const recommend = [];
+        for (let a of doc.querySelectorAll("#tjmanhua li a")) {
+            const img = a.querySelector("img");
+            const id = this.parseId(a.attributes["href"] || "");
+            if (!img || !id) {
+                continue;
+            }
+            recommend.push(new Comic({
+                id: id,
+                title: a.attributes["title"] || img.attributes["alt"] || "",
+                cover: img.attributes["src"],
+            }));
+        }
+
+        return {
+            title: doc.querySelector(".sub_r .h1").text.trim(),
+            cover: coverImg ? coverImg.attributes["src"] : undefined,
+            description: this.parseDescription(doc.querySelector(".detailContent p")),
+            tags: tags,
+            chapters: this.parseChapters(doc, ".chapters ul"),
+            updateTime: updateTime,
+            recommend: recommend,
+        };
     }
 
     /**

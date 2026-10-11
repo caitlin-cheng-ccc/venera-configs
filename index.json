@@ -212,7 +212,7 @@
         "name": "漫画160",
         "fileName": "mh160.js",
         "key": "mh160",
-        "version": "1.0.0",
-        "description": "搜索需要先通过 Cloudflare 验证"
+        "version": "1.0.1",
+        "description": "搜索前请在源设置中点击「登录」完成 Cloudflare 验证"
     }
 ]
