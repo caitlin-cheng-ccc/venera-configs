@@ -207,5 +207,12 @@
         "fileName": "rumanhua.js",
         "key": "rumanhua",
         "version": "1.0.3"
+    },
+    {
+        "name": "漫画160",
+        "fileName": "mh160.js",
+        "key": "mh160",
+        "version": "1.0.0",
+        "description": "搜索需要先通过 Cloudflare 验证"
     }
 ]
